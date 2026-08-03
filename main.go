@@ -247,33 +247,36 @@ func paintColor(gtx layout.Context, c color.NRGBA) {
 // --- LOGIC ---
 
 func checkVersion(w *app.Window) {
+	// 1. Read local version.txt created during extract or initial install
 	localVerFile := filepath.Join(state.InstallPath, "version.txt")
 	if data, err := os.ReadFile(localVerFile); err == nil {
-		state.LocalVersion = strings.TrimSpace(string(data))
+		state.LocalVersion = normalizeVersion(string(data))
 	} else {
 		state.LocalVersion = "None"
 	}
 
-	rel, err := fetchLatestRelease()
+	// 2. Query GitHub REST API for the latest published Git release tag
+	rel, err := fetchLatestGitRelease()
 	if err == nil {
-		state.RemoteVersion = strings.TrimSpace(rel.TagName)
-		state.DownloadURL = getZipURL(rel)
+		state.RemoteVersion = normalizeVersion(rel.TagName)
+		state.DownloadURL = getZipAssetURL(rel)
 
 		if state.DownloadURL == "" {
-			state.Status = "No zip file attached to latest release."
-		} else if state.LocalVersion == state.RemoteVersion {
-			state.Status = "You are up to date."
+			state.Status = "No .zip asset attached to latest Git release."
+		} else if isNewerVersion(state.RemoteVersion, state.LocalVersion) {
+			state.Status = "New version available!"
 		} else {
-			state.Status = "Ready to update."
+			state.Status = "You are up to date."
 		}
 	} else {
-		state.Status = "Error checking GitHub: " + err.Error()
+		state.Status = "Error checking Git releases: " + err.Error()
 	}
 
 	w.Invalidate()
 }
 
-func fetchLatestRelease() (*GHRelease, error) {
+// Fetches latest published release object from GitHub repository
+func fetchLatestGitRelease() (*GHRelease, error) {
 	req, err := http.NewRequest("GET", GitHubAPIURL, nil)
 	if err != nil {
 		return nil, err
@@ -288,8 +291,11 @@ func fetchLatestRelease() (*GHRelease, error) {
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("no releases found on GitHub repo yet")
+	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("GitHub API returned status %d", resp.StatusCode)
+		return nil, fmt.Errorf("GitHub API status %d", resp.StatusCode)
 	}
 
 	var rel GHRelease
@@ -297,6 +303,31 @@ func fetchLatestRelease() (*GHRelease, error) {
 		return nil, err
 	}
 	return &rel, nil
+}
+
+// Strips extra whitespace/newlines and optional 'v' prefix (e.g. "v2.1\n" -> "2.1")
+func normalizeVersion(v string) string {
+	v = strings.TrimSpace(v)
+	v = strings.TrimPrefix(v, "v")
+	return v
+}
+
+// Checks if remote tag is different / newer than local tag
+func isNewerVersion(remote, local string) bool {
+	if local == "None" || local == "" {
+		return true
+	}
+	return remote != local
+}
+
+// Finds the .zip asset in the GitHub Release payload
+func getZipAssetURL(rel *GHRelease) string {
+	for _, asset := range rel.Assets {
+		if strings.HasSuffix(asset.Name, ".zip") {
+			return asset.BrowserDownloadURL
+		}
+	}
+	return ""
 }
 
 func getZipURL(rel *GHRelease) string {
