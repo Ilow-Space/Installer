@@ -2,6 +2,7 @@ package main
 
 import (
 	"archive/zip"
+	"encoding/json"
 	"fmt"
 	"image/color"
 	"io"
@@ -28,16 +29,49 @@ import (
 
 // --- CONFIG ---
 const (
-	AppName          = "Ilöw Sniffer"
-	RemoteVersionURL = "https://ilow.io/static/dist/sniffer/version.txt"   // CHANGE THIS
-	RemoteZipURL     = "https://ilow.io/static/dist/sniffer/extension.zip" // CHANGE THIS
+	AppName       = "Ilöw Agent"
+	RepoOwnerRepo = "Ilow-Space/IlowSniffer"
+	GitHubAPIURL  = "https://api.github.com/repos/" + RepoOwnerRepo + "/releases/latest"
 )
+
+// GitHub API JSON Response Structs
+type GHAsset struct {
+	Name               string `json:"name"`
+	BrowserDownloadURL string `json:"browser_download_url"`
+}
+
+type GHRelease struct {
+	TagName string    `json:"tag_name"`
+	Assets  []GHAsset `json:"assets"`
+}
+
+// --- THEME COLORS ---
+type ThemeColors struct {
+	Bg          color.NRGBA
+	Fg          color.NRGBA
+	Accent      color.NRGBA
+	Muted       color.NRGBA
+	Faint       color.NRGBA
+	SecondaryBg color.NRGBA
+	DisabledBg  color.NRGBA
+}
+
+var theme = ThemeColors{
+	Bg:          color.NRGBA{R: 10, G: 10, B: 10, A: 255},
+	Fg:          color.NRGBA{R: 229, G: 231, B: 235, A: 255},
+	Accent:      color.NRGBA{R: 59, G: 130, B: 246, A: 255},
+	Muted:       color.NRGBA{R: 156, G: 163, B: 175, A: 255},
+	Faint:       color.NRGBA{R: 107, G: 114, B: 128, A: 255},
+	SecondaryBg: color.NRGBA{R: 51, G: 51, B: 51, A: 255},
+	DisabledBg:  color.NRGBA{R: 50, G: 50, B: 50, A: 255},
+}
 
 // --- STATE ---
 type AppState struct {
 	Status        string
 	LocalVersion  string
 	RemoteVersion string
+	DownloadURL   string
 	InstallPath   string
 	IsWorking     bool
 
@@ -53,7 +87,6 @@ var state = AppState{
 
 // --- MAIN ---
 func main() {
-	// Determine install path on launch
 	homeDir, _ := os.UserHomeDir()
 	state.InstallPath = filepath.Join(homeDir, "AppData", "Local", "IlowAgent")
 	if runtime.GOOS == "darwin" {
@@ -61,7 +94,6 @@ func main() {
 	}
 
 	go func() {
-		// NEW: Window creation syntax for latest Gio
 		w := new(app.Window)
 		w.Option(
 			app.Title("Ilöw Installer"),
@@ -78,18 +110,15 @@ func main() {
 }
 
 func loop(w *app.Window) error {
-	// NEW: Font handling
 	th := material.NewTheme()
 	th.Shaper = text.NewShaper(text.WithCollection(gofont.Collection()))
 
-	// Custom Colors (Dark Theme)
-	th.Palette.Bg = color.NRGBA{R: 20, G: 20, B: 20, A: 255}           // #141414
-	th.Palette.Fg = color.NRGBA{R: 230, G: 230, B: 230, A: 255}        // White text
-	th.Palette.ContrastBg = color.NRGBA{R: 16, G: 185, B: 129, A: 255} // #10b981 (Green)
+	th.Palette.Bg = theme.Bg
+	th.Palette.Fg = theme.Fg
+	th.Palette.ContrastBg = theme.Accent
 
 	var ops op.Ops
 
-	// Check version on startup in background
 	go checkVersion(w)
 
 	for {
@@ -100,12 +129,10 @@ func loop(w *app.Window) error {
 		case app.FrameEvent:
 			gtx := app.NewContext(&ops, e)
 
-			// Process Button Clicks
 			if state.BtnAction.Clicked(gtx) && !state.IsWorking {
 				go performUpdate(w)
 			}
 			if state.BtnCopyPath.Clicked(gtx) {
-				// NEW: Clipboard syntax
 				gtx.Execute(clipboard.WriteCmd{
 					Type: "application/text",
 					Data: io.NopCloser(strings.NewReader(state.InstallPath)),
@@ -113,7 +140,6 @@ func loop(w *app.Window) error {
 				state.Status = "Path copied to clipboard!"
 			}
 
-			// Draw Interface
 			drawUI(gtx, th)
 			e.Frame(gtx.Ops)
 		}
@@ -122,15 +148,11 @@ func loop(w *app.Window) error {
 
 // --- UI LAYOUT ---
 func drawUI(gtx layout.Context, th *material.Theme) layout.Dimensions {
-	// Background fill
 	paintColor(gtx, th.Palette.Bg)
-
-	// Padding
 	inset := layout.Inset{Top: unit.Dp(20), Bottom: unit.Dp(20), Left: unit.Dp(20), Right: unit.Dp(20)}
 
 	return inset.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 		return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
-			// 1. Header
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				h1 := material.H4(th, AppName)
 				h1.Color = th.Palette.ContrastBg
@@ -138,14 +160,10 @@ func drawUI(gtx layout.Context, th *material.Theme) layout.Dimensions {
 				return h1.Layout(gtx)
 			}),
 			layout.Rigid(layout.Spacer{Height: unit.Dp(30)}.Layout),
-
-			// 2. Version Info Box
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				return drawInfoBox(gtx, th)
 			}),
 			layout.Rigid(layout.Spacer{Height: unit.Dp(20)}.Layout),
-
-			// 3. Main Action Button
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				btnText := "CHECK FOR UPDATES"
 				if state.IsWorking {
@@ -156,61 +174,44 @@ func drawUI(gtx layout.Context, th *material.Theme) layout.Dimensions {
 
 				btn := material.Button(th, &state.BtnAction, btnText)
 				if state.IsWorking {
-					btn.Background = color.NRGBA{R: 50, G: 50, B: 50, A: 255}
+					btn.Background = theme.DisabledBg
 				}
 				return btn.Layout(gtx)
 			}),
-
-			// 4. Status Text
 			layout.Rigid(layout.Spacer{Height: unit.Dp(10)}.Layout),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				lbl := material.Label(th, unit.Sp(12), state.Status)
 				lbl.Alignment = text.Middle
-				lbl.Color = color.NRGBA{R: 150, G: 150, B: 150, A: 255}
+				lbl.Color = theme.Muted
 				return lbl.Layout(gtx)
 			}),
-
 			layout.Rigid(layout.Spacer{Height: unit.Dp(30)}.Layout),
-
-			// 5. Instructions Divider
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				div := material.Body2(th, "INSTRUCTIONS")
 				div.Color = th.Palette.ContrastBg
-				div.Font.Weight = font.Bold // NEW: Use font package
+				div.Font.Weight = font.Bold
 				return div.Layout(gtx)
 			}),
 			layout.Rigid(layout.Spacer{Height: unit.Dp(10)}.Layout),
-
-			// 6. Instruction Steps
-			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				return material.Label(th, unit.Sp(13), "1. Click 'Install Update' above.").Layout(gtx)
-			}),
+			layout.Rigid(material.Label(th, unit.Sp(13), "1. Click 'Install Update' above.").Layout),
 			layout.Rigid(layout.Spacer{Height: unit.Dp(5)}.Layout),
-			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				return material.Label(th, unit.Sp(13), "2. Go to chrome://extensions").Layout(gtx)
-			}),
+			layout.Rigid(material.Label(th, unit.Sp(13), "2. Go to chrome://extensions").Layout),
 			layout.Rigid(layout.Spacer{Height: unit.Dp(5)}.Layout),
-			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				return material.Label(th, unit.Sp(13), "3. Enable 'Developer Mode' (Top Right).").Layout(gtx)
-			}),
+			layout.Rigid(material.Label(th, unit.Sp(13), "3. Enable 'Developer Mode' (Top Right).").Layout),
 			layout.Rigid(layout.Spacer{Height: unit.Dp(5)}.Layout),
-			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				return material.Label(th, unit.Sp(13), "4. Click 'Load Unpacked' and select:").Layout(gtx)
-			}),
-
-			// 7. Path Display & Copy Button
+			layout.Rigid(material.Label(th, unit.Sp(13), "4. Click 'Load Unpacked' and select:").Layout),
 			layout.Rigid(layout.Spacer{Height: unit.Dp(10)}.Layout),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
 					layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
 						lbl := material.Label(th, unit.Sp(11), state.InstallPath)
-						lbl.Color = color.NRGBA{R: 100, G: 100, B: 100, A: 255} // Dim
+						lbl.Color = theme.Faint
 						return lbl.Layout(gtx)
 					}),
 					layout.Rigid(layout.Spacer{Width: unit.Dp(10)}.Layout),
 					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 						btn := material.Button(th, &state.BtnCopyPath, "COPY")
-						btn.Background = color.NRGBA{R: 60, G: 60, B: 60, A: 255}
+						btn.Background = theme.SecondaryBg
 						btn.TextSize = unit.Sp(10)
 						btn.Inset = layout.UniformInset(unit.Dp(5))
 						return btn.Layout(gtx)
@@ -239,8 +240,6 @@ func drawInfoBox(gtx layout.Context, th *material.Theme) layout.Dimensions {
 }
 
 func paintColor(gtx layout.Context, c color.NRGBA) {
-	// NEW: Rect variable used properly implicitly by PaintOp? No, we need explicit clip.
-	// Actually, just painting color over Max constraints is enough for background.
 	paint.ColorOp{Color: c}.Add(gtx.Ops)
 	paint.PaintOp{}.Add(gtx.Ops)
 }
@@ -248,7 +247,6 @@ func paintColor(gtx layout.Context, c color.NRGBA) {
 // --- LOGIC ---
 
 func checkVersion(w *app.Window) {
-	// 1. Check Local
 	localVerFile := filepath.Join(state.InstallPath, "version.txt")
 	if data, err := os.ReadFile(localVerFile); err == nil {
 		state.LocalVersion = strings.TrimSpace(string(data))
@@ -256,47 +254,87 @@ func checkVersion(w *app.Window) {
 		state.LocalVersion = "None"
 	}
 
-	// 2. Check Remote
-	if remote, err := fetchString(RemoteVersionURL); err == nil {
-		state.RemoteVersion = strings.TrimSpace(remote)
-		state.Status = "Ready to update."
-		if state.LocalVersion == state.RemoteVersion {
+	rel, err := fetchLatestRelease()
+	if err == nil {
+		state.RemoteVersion = strings.TrimSpace(rel.TagName)
+		state.DownloadURL = getZipURL(rel)
+
+		if state.DownloadURL == "" {
+			state.Status = "No zip file attached to latest release."
+		} else if state.LocalVersion == state.RemoteVersion {
 			state.Status = "You are up to date."
+		} else {
+			state.Status = "Ready to update."
 		}
 	} else {
-		state.Status = "Error connecting to server."
+		state.Status = "Error checking GitHub: " + err.Error()
 	}
 
 	w.Invalidate()
 }
 
+func fetchLatestRelease() (*GHRelease, error) {
+	req, err := http.NewRequest("GET", GitHubAPIURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	// GitHub API requires a User-Agent header
+	req.Header.Set("User-Agent", "IlowAgent-Installer")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GitHub API returned status %d", resp.StatusCode)
+	}
+
+	var rel GHRelease
+	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
+		return nil, err
+	}
+	return &rel, nil
+}
+
+func getZipURL(rel *GHRelease) string {
+	for _, asset := range rel.Assets {
+		if strings.HasSuffix(asset.Name, ".zip") {
+			return asset.BrowserDownloadURL
+		}
+	}
+	return ""
+}
+
 func performUpdate(w *app.Window) {
+	if state.DownloadURL == "" {
+		state.Status = "Error: Download URL missing."
+		w.Invalidate()
+		return
+	}
+
 	state.IsWorking = true
-	state.Status = "Downloading..."
+	state.Status = "Downloading from GitHub..."
 	w.Invalidate()
 
-	// Wait a moment so UI updates
 	time.Sleep(100 * time.Millisecond)
 
 	err := func() error {
-		// Create Dir
 		os.MkdirAll(state.InstallPath, 0755)
-
-		// Download Zip
 		tmpZip := filepath.Join(os.TempDir(), "ilow_temp.zip")
-		if err := downloadFile(tmpZip, RemoteZipURL); err != nil {
+		if err := downloadFile(tmpZip, state.DownloadURL); err != nil {
 			return err
 		}
 		defer os.Remove(tmpZip)
 
-		// Unzip
 		state.Status = "Extracting files..."
 		w.Invalidate()
 		if err := unzip(tmpZip, state.InstallPath); err != nil {
 			return err
 		}
 
-		// Update Version File
 		localVerFile := filepath.Join(state.InstallPath, "version.txt")
 		os.WriteFile(localVerFile, []byte(state.RemoteVersion), 0644)
 
@@ -314,29 +352,33 @@ func performUpdate(w *app.Window) {
 }
 
 // --- FILE UTILS ---
+
 func downloadFile(filepath string, url string) error {
-	resp, err := http.Get(url)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("User-Agent", "IlowAgent-Installer")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+
 	out, err := os.Create(filepath)
 	if err != nil {
 		return err
 	}
 	defer out.Close()
+
 	_, err = io.Copy(out, resp.Body)
 	return err
-}
-
-func fetchString(url string) (string, error) {
-	resp, err := http.Get(url)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	return string(body), err
 }
 
 func unzip(src string, dest string) error {
@@ -345,6 +387,7 @@ func unzip(src string, dest string) error {
 		return err
 	}
 	defer r.Close()
+
 	for _, f := range r.File {
 		fpath := filepath.Join(dest, f.Name)
 		if !strings.HasPrefix(fpath, filepath.Clean(dest)+string(os.PathSeparator)) {
