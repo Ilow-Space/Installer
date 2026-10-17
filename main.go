@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -32,6 +33,11 @@ const (
 	AppName       = "Ilöw Agent"
 	RepoOwnerRepo = "Ilow-Space/IlowSniffer"
 	GitHubAPIURL  = "https://api.github.com/repos/" + RepoOwnerRepo + "/releases/latest"
+
+	// Release asset the installer replaces itself with; self-update is skipped if absent.
+	InstallerAsset = "IlowInstaller.exe"
+	BackgroundFlag = "--background"
+	CheckInterval  = 6 * time.Hour
 )
 
 // GitHub API JSON Response Structs
@@ -91,6 +97,19 @@ func main() {
 	state.InstallPath = filepath.Join(homeDir, "AppData", "Local", "IlowAgent")
 	if runtime.GOOS == "darwin" {
 		state.InstallPath = filepath.Join(homeDir, "Library", "Application Support", "IlowAgent")
+	}
+
+	if exe, err := os.Executable(); err == nil {
+		os.Remove(exe + ".old") // left behind by a previous self-update
+	}
+	enableAutostart() // re-written every launch so it follows the exe if it moves
+
+	// Started at login: no window, just keep the extension and this exe current.
+	if len(os.Args) > 1 && os.Args[1] == BackgroundFlag {
+		for {
+			backgroundCycle()
+			time.Sleep(CheckInterval)
+		}
 	}
 
 	go func() {
@@ -268,6 +287,7 @@ func checkVersion(w *app.Window) {
 		} else {
 			state.Status = "You are up to date."
 		}
+		selfUpdate(rel)
 	} else {
 		state.Status = "Error checking Git releases: " + err.Error()
 	}
@@ -352,25 +372,7 @@ func performUpdate(w *app.Window) {
 
 	time.Sleep(100 * time.Millisecond)
 
-	err := func() error {
-		os.MkdirAll(state.InstallPath, 0755)
-		tmpZip := filepath.Join(os.TempDir(), "ilow_temp.zip")
-		if err := downloadFile(tmpZip, state.DownloadURL); err != nil {
-			return err
-		}
-		defer os.Remove(tmpZip)
-
-		state.Status = "Extracting files..."
-		w.Invalidate()
-		if err := unzip(tmpZip, state.InstallPath); err != nil {
-			return err
-		}
-
-		localVerFile := filepath.Join(state.InstallPath, "version.txt")
-		os.WriteFile(localVerFile, []byte(state.RemoteVersion), 0644)
-
-		return nil
-	}()
+	err := installExtension()
 
 	state.IsWorking = false
 	if err != nil {
@@ -380,6 +382,77 @@ func performUpdate(w *app.Window) {
 		state.Status = "Success! Extension updated."
 	}
 	w.Invalidate()
+}
+
+func installExtension() error {
+	os.MkdirAll(state.InstallPath, 0755)
+	tmpZip := filepath.Join(os.TempDir(), "ilow_temp.zip")
+	if err := downloadFile(tmpZip, state.DownloadURL); err != nil {
+		return err
+	}
+	defer os.Remove(tmpZip)
+
+	if err := unzip(tmpZip, state.InstallPath); err != nil {
+		return err
+	}
+	// version.txt is written last: the extension reloads itself when it changes.
+	return os.WriteFile(filepath.Join(state.InstallPath, "version.txt"), []byte(state.RemoteVersion), 0644)
+}
+
+// One headless check: update the extension files, then this exe.
+func backgroundCycle() {
+	rel, err := fetchLatestGitRelease()
+	if err != nil {
+		return
+	}
+	state.RemoteVersion = normalizeVersion(rel.TagName)
+	state.DownloadURL = getZipAssetURL(rel)
+	data, _ := os.ReadFile(filepath.Join(state.InstallPath, "version.txt"))
+	if state.DownloadURL != "" && isNewerVersion(state.RemoteVersion, normalizeVersion(string(data))) {
+		installExtension()
+	}
+	selfUpdate(rel)
+}
+
+// Swaps in the release's installer exe (a running exe can be renamed but not
+// overwritten on Windows), relaunches with the same args and exits.
+// ponytail: no checksum/signature, trusts the GitHub release over HTTPS; add if releases get signed.
+func selfUpdate(rel *GHRelease) {
+	if runtime.GOOS != "windows" {
+		return
+	}
+	url := ""
+	for _, a := range rel.Assets {
+		if a.Name == InstallerAsset {
+			url = a.BrowserDownloadURL
+		}
+	}
+	tag := normalizeVersion(rel.TagName)
+	marker := filepath.Join(state.InstallPath, "installer-version.txt")
+	if data, _ := os.ReadFile(marker); url == "" || normalizeVersion(string(data)) == tag {
+		return
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return
+	}
+	if downloadFile(exe+".new", url) != nil {
+		os.Remove(exe + ".new")
+		return
+	}
+	os.Remove(exe + ".old")
+	if os.Rename(exe, exe+".old") != nil {
+		os.Remove(exe + ".new")
+		return
+	}
+	if os.Rename(exe+".new", exe) != nil {
+		os.Rename(exe+".old", exe)
+		return
+	}
+	os.MkdirAll(state.InstallPath, 0755)
+	os.WriteFile(marker, []byte(tag), 0644)
+	exec.Command(exe, os.Args[1:]...).Start()
+	os.Exit(0)
 }
 
 // --- FILE UTILS ---
